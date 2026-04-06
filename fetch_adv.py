@@ -14,7 +14,7 @@ import re
 import sys
 import json
 import requests
-import pdfplumber
+import pypdf
 
 
 def resolve_crd_from_name(firm_name: str):
@@ -69,9 +69,9 @@ def extract_and_clean_text(pdf_bytes: bytes) -> tuple[str, str]:
 
     Only reads the PDF once for efficiency.
     """
-    pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
     pages_text = []
-    for page in pdf.pages:
+    for page in reader.pages:
         text = page.extract_text()
         if text:
             pages_text.append(text)
@@ -221,7 +221,7 @@ def parse_aum(text: str) -> dict:
         aum['total_accounts'] = int(m.group(1))
 
     # Non-US RAUM
-    m = re.search(r'attributable to clients\s*who\s*\nare non-United States persons\?\s*\n\$\s*([\d,]+)', text)
+    m = re.search(r'attributable to clients\s*who\s*\nare non-\s*United States persons\??\s*\n\$\s*([\d,]+)', text)
     if m:
         aum['non_us_raum'] = int(m.group(1).replace(',', ''))
 
@@ -298,10 +298,14 @@ def parse_private_funds(raw_text: str) -> list[dict]:
                 fund['is_feeder_fund'] = True
                 fund['master_fund'] = m_feeder.group(1).strip()
 
-            # State/Country of organization
-            m = re.search(r'private fund organized:\s*\nState:\s*Country:\s*\n(.+)', block)
+            # State/Country of organization (pypdf splits State/Country onto separate lines)
+            m = re.search(r'organized:\s*\nState:\s*\n(.+?)\s*\nCountry:\s*\n(.+?)(?:\n|$)', block)
             if m:
-                fund['jurisdiction'] = m.group(1).strip()
+                fund['jurisdiction'] = f"{m.group(1).strip()} {m.group(2).strip()}"
+            else:
+                m = re.search(r'private fund organized:\s*\nState:\s*Country:\s*\n(.+)', block)
+                if m:
+                    fund['jurisdiction'] = m.group(1).strip()
 
             # Fund type (question 10)
             m = re.search(r'type of fund is the private fund\?\s*\n(.+?)(?:\n|$)', block)
@@ -514,10 +518,10 @@ def parse_client_breakdown(text: str) -> list[dict]:
         'n': 'Other',
     }
 
-    # Find the 5.D section
-    section_start = text.find('Number of (2) Fewer than (3) Amount of Regulatory Assets')
+    # Find the 5.D section — try both pdfplumber and pypdf anchor text
+    section_start = text.find('Type of Client')
     if section_start < 0:
-        section_start = text.find('Type of Client')
+        section_start = text.find('Number of (2) Fewer than (3) Amount of Regulatory Assets')
     if section_start < 0:
         return clients
 
@@ -527,22 +531,20 @@ def parse_client_breakdown(text: str) -> list[dict]:
 
     section_text = text[section_start:section_end]
 
-    # Parse line by line looking for rows with data
-    # A data row has format: "(x) Label text... COUNT $ AMOUNT"
-    # where COUNT is the number of accounts and AMOUNT is the AUM
-    for line in section_text.split('\n'):
-        # Match a line starting with (letter) that contains a dollar amount
-        m = re.match(r'\(([a-n])\)\s+.+?(\d+)\s+\$\s+([\d,]+)', line)
+    # Split section into per-letter blocks, then find count + $ in each block.
+    # pypdf wraps long labels onto the next line, so we can't rely on a single
+    # line matching — instead we grab everything up to the next (letter) entry.
+    entries = re.findall(
+        r'\(([a-n])\)\s+(.*?)(?=\n\([a-n]\)|\nCompensation|$)',
+        section_text, re.DOTALL
+    )
+    for letter, block in entries:
+        m = re.search(r'(\d+)\s*\n?\s*\$\s*([\d,]+)', block)
         if m:
-            letter = m.group(1)
-            accounts = int(m.group(2))
-            aum = int(m.group(3).replace(',', ''))
+            accounts = int(m.group(1))
+            aum = int(m.group(2).replace(',', ''))
             label = client_labels.get(letter, f'Unknown ({letter})')
-            clients.append({
-                'type': label,
-                'accounts': accounts,
-                'aum': aum,
-            })
+            clients.append({'type': label, 'accounts': accounts, 'aum': aum})
 
     return clients
 
