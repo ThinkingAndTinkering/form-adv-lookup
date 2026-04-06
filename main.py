@@ -1,5 +1,7 @@
 import subprocess
 import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +12,11 @@ from pydantic import BaseModel
 app = FastAPI(title="Form ADV Lookup")
 
 FETCH_ADV = Path(__file__).parent / "fetch_adv.py"
+STATIC = Path(__file__).parent / "static"
+
+# In-memory job store (fine for single-instance free tier)
+jobs: dict = {}
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 class LookupRequest(BaseModel):
@@ -17,7 +24,20 @@ class LookupRequest(BaseModel):
     crd: Optional[str] = None
 
 
-STATIC = Path(__file__).parent / "static"
+def run_lookup(job_id: str, cmd: list):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            jobs[job_id] = {
+                "status": "error",
+                "detail": result.stderr.strip() or "fetch_adv.py failed",
+            }
+        else:
+            jobs[job_id] = {"status": "done", "output": result.stdout.strip()}
+    except subprocess.TimeoutExpired:
+        jobs[job_id] = {"status": "error", "detail": "Timed out after 3 minutes"}
+    except Exception as e:
+        jobs[job_id] = {"status": "error", "detail": str(e)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -36,15 +56,16 @@ def lookup(req: LookupRequest):
     else:
         cmd += ["--name", req.name]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "pending"}
+    executor.submit(run_lookup, job_id, cmd)
 
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=502,
-            detail=result.stderr.strip() or "fetch_adv.py failed with no output",
-        )
+    return {"job_id": job_id}
 
-    return {
-        "output": result.stdout.strip(),
-        "log": result.stderr.strip(),
-    }
+
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job

@@ -94,6 +94,20 @@
     }
 
     .error { color: #d70015; }
+
+    .spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #ccc;
+      border-top-color: #555;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -117,6 +131,40 @@
 
     input.addEventListener('keydown', e => { if (e.key === 'Enter') lookup(); });
 
+    let elapsed = 0;
+    let timer = null;
+
+    function setStatus(html) { status.innerHTML = html; }
+
+    function startTimer() {
+      elapsed = 0;
+      clearInterval(timer);
+      timer = setInterval(() => {
+        elapsed++;
+        setStatus(`<span class="spinner"></span>Fetching ADV… ${elapsed}s`);
+      }, 1000);
+    }
+
+    function stopTimer() {
+      clearInterval(timer);
+      timer = null;
+    }
+
+    async function poll(jobId) {
+      while (true) {
+        await new Promise(r => setTimeout(r, 2000));
+        const resp = await fetch(`/status/${jobId}`);
+        const data = await resp.json();
+
+        if (data.status === 'done') {
+          return { ok: true, output: data.output };
+        } else if (data.status === 'error') {
+          return { ok: false, detail: data.detail };
+        }
+        // still pending — keep polling
+      }
+    }
+
     async function lookup() {
       const raw = input.value.trim();
       if (!raw) return;
@@ -124,33 +172,41 @@
       btn.disabled = true;
       result.style.display = 'none';
       result.className = '';
-      status.textContent = 'Fetching ADV — this can take 15-30 seconds…';
+      startTimer();
 
       const body = /^\d+$/.test(raw) ? { crd: raw } : { name: raw };
 
       try {
-        const resp = await fetch('/lookup', {
+        // Kick off the job
+        const initResp = await fetch('/lookup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
 
-        const data = await resp.json();
-
-        if (!resp.ok) {
-          result.className = 'error';
-          result.textContent = data.detail || 'Unknown error';
-        } else {
-          result.textContent = data.output;
+        if (!initResp.ok) {
+          const err = await initResp.json();
+          throw new Error(err.detail || 'Failed to start lookup');
         }
-        result.style.display = 'block';
-        status.textContent = '';
+
+        const { job_id } = await initResp.json();
+
+        // Poll until done
+        const res = await poll(job_id);
+
+        if (res.ok) {
+          result.textContent = res.output;
+        } else {
+          result.className = 'error';
+          result.textContent = res.detail;
+        }
       } catch (err) {
         result.className = 'error';
-        result.textContent = 'Network error: ' + err.message;
-        result.style.display = 'block';
-        status.textContent = '';
+        result.textContent = 'Error: ' + err.message;
       } finally {
+        stopTimer();
+        setStatus('');
+        result.style.display = 'block';
         btn.disabled = false;
       }
     }
